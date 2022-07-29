@@ -1,0 +1,425 @@
+<html>
+<head>
+<style>
+
+.hide { display: none; }
+
+</style>
+</head>
+<body>
+
+<h1>multisync by firecubez#0801</h1>
+<h1 id="status"></h1>
+<div id="loading">connecting to server...</div>
+<div id="loaded">
+	<span id="online">loading online users...</span>
+	<input id="username" type="text" placeholder="username" />
+	<button onclick="changeUsername()">change username</button>
+	<hr>
+
+	<span id="bpm">loading bpm...</span>
+	<input id="bpm_in" type="text" placeholder="bpm" />
+	<button onclick="changeBPM()">change bpm for countdown</button>
+	<br><br>
+
+	<span id="cnt">loading counts...</span>
+	<input id="cnt_in" type="text" placeholder="counts" />
+	<button onclick="changeCounts()">change counts for countdown</button>
+	<br><br>
+	
+	<p id="backing">loading backing track...</p>
+	<audio controls id="backing_au"></audio><br>
+	<input id="backing_in" type="file" />
+	<button onclick="changeBacking()">change backing track</button>
+	<br><br>
+	<input id="metro_in" type="text" placeholder="bpm" />
+	<input id="metro_sig_in" type="text" placeholder="time signature" />/4
+	<button onclick="changeMetro()">use metronome backing track</button>
+	<br><br><span id="audience">loading backing track distribution...</span>
+	<button onclick="changeAudience(true)">audience and performers hear backing track</button>
+	<button onclick="changeAudience(false)">only performers hear backing track</button>
+	<hr>
+	<h2>warning: compression is broken right now</h2>
+	<span id="compression">not using compression</span>
+	<button onclick="changeCompression(true)">enable compression</button>
+	<button onclick="changeCompression(false)">disable compression</button>
+	<hr>
+	
+	<span id="input_off">input offset: 0ms</span>
+	<input id="off_in" type="text" placeholder="offset" />
+	<button onclick="changeOffset()">change input offset (ms, more = earlier)</button>
+	
+	<br><br><button onclick="beginSync()">begin sync</button>
+	<button onclick="endSync()">end sync</button>
+	<input id="sync_earlier" type="text" placeholder="ms earlier">
+	<button onclick="playSync()">play sync</button>
+	<button onclick="endPlaySync()">stop playing sync</button>
+	<hr>
+	<h2>advanced stuff</h2>
+	<input id="target_in" type="text" placeholder="username" />
+	<input id="sync_in" type="text" placeholder="sync">
+	<button onclick="soloUser()">stop multisync; just play the audio for this user</button>
+	<button onclick="syncUser()">make user earlier (ms)</button>
+	<br><br><span id="sbuf">loading minimum sample buffer size...</span>
+	<input id="sbuf_in" type="text" placeholder="minimum sample buffer size">
+	<button onclick="changeMinBuf()">set minimum sample buffer size (ms) (more = playback starts later for audience, but more lag tolerance)</button>
+	<hr>
+	<h1>status: currently not live</h1>
+	<button onclick="start()">start for everyone</button>
+	<button onclick="stop()">stop for everyone</button>
+	<h1 id="counter"></h1>
+</div>
+
+<script>
+	window.audioContext = new AudioContext({
+		sampleRate: 48000
+	});
+	if(window.audioContext.sampleRate !== 48000) alert("Your browser does not support the required sample rate, instead " + window.audioContext.sampleRate);
+</script>
+<script src="./ws-audio-api.min.js"></script>
+<script>
+
+let status = document.getElementById("status");
+if(!navigator.getUserMedia) {
+	status.innerHTML = "error: can't get microphone input. check your settings (chrome://flags/#unsafely-treat-insecure-origin-as-secure, edge://flags/#unsafely-treat-insecure-origin-as-secure)";
+}
+
+let loading = document.getElementById("loading");
+let loaded = document.getElementById("loaded");
+
+let onlineUsers = document.getElementById("online");
+let usernameInput = document.getElementById("username");
+
+let bpm = document.getElementById("bpm");
+let bpmInput = document.getElementById("bpm_in");
+let counts = document.getElementById("cnt");
+let countsInput = document.getElementById("cnt_in");
+let compression = document.getElementById("compression");
+let backing = document.getElementById("backing");
+let backingAudio = document.getElementById("backing_au");
+let backingInput = document.getElementById("backing_in");
+let counter = document.getElementById("counter");
+let offsetInput = document.getElementById("off_in");
+let soloInput = document.getElementById("target_in");
+let syncInput = document.getElementById("sync_in");
+let syncEarlier = document.getElementById("sync_earlier");
+let minBuf = document.getElementById("sbuf");
+let minBufInput = document.getElementById("sbuf_in");
+let metroInput = document.getElementById("metro_in");
+let metroSigInput = document.getElementById("metro_sig_in");
+let audience = document.getElementById("audience");
+let backingData = null;
+let backingNode = null;
+let metronomeBPM = 0;
+let metronomeSig = 0;
+loaded.className = "hide";
+
+usernameInput.value = "anon" + (Math.random() * 100000 >>> 0);
+
+let ws = new WebSocket("ws://" + location.hostname + ":3000");
+ws.binaryType = "blob";
+
+ws.addEventListener("open", e => {
+	loading.className = "hide";
+	loaded.className = "";
+	changeUsername();
+});
+
+ws.addEventListener("error", e => {
+	loading.className = "";
+	loaded.className = "hide";
+	loading.innerText = "failed to connect to server";
+});
+
+ws.addEventListener("close", e => {
+	loading.className = "";
+	loaded.className = "hide";
+	loading.innerText = "connection to server was closed";
+});
+
+ws.addEventListener("message", e => {
+	if(e.data instanceof Blob) {
+		backing.innerText = "loading backing track";
+		backingAudio.src = URL.createObjectURL(e.data);
+		backingAudio.load();
+		e.data.arrayBuffer().then(x => {
+			backing.innerText = "decoding backing track";
+			audioContext.decodeAudioData(x, d => {
+				backing.innerText = "decoded backing track";
+				setTimeout(() => {
+					backing.innerText = "";
+				}, 1000);
+				backingData = d;
+			}, () => {
+				backing.innerText = "failed to decode backing track";
+				backingData = null;
+			});
+		});
+	} else if(e.data.startsWith("onl:")) {
+		onlineUsers.innerText = "online users: " + e.data.slice(4);
+	} else if(e.data.startsWith("bpm:")) {
+		bpm.innerText = "bpm: " + e.data.slice(4);
+	} else if(e.data.startsWith("cnt:")) {
+		counts.innerText = "counts: " + e.data.slice(4);
+	} else if(e.data.startsWith("buf:")) {
+		minBuf.innerText = "minimum sample buffer size: " + e.data.slice(4);
+	} else if(e.data.startsWith("bck:")) {
+		backing.innerText = "backing track is changing, please wait...";
+	} else if(e.data.startsWith("met:")) {
+		backing.innerText = "backing track is being generated, plese wait...";
+		let parts = e.data.split(":");
+		metronomeBPM = Number(parts[1]);
+		metronomeSig = parseInt(parts[2]);
+		let pcm = generateMetronome(metronomeBPM, metronomeSig);
+		let wav = generateWav(pcm);
+		backingAudio.src = URL.createObjectURL(wav);
+		backingAudio.load();
+		backing.innerText = "generated backing track";
+		setTimeout(() => {
+			backing.innerText = "";
+		}, 1000);
+		backingData = pcm;
+	} else if(e.data.startsWith("srt:")) {
+		streamer.samplesWritten = 0;
+		streamer.start();
+		let sampleWait = parseInt(e.data.slice(4));
+		let w = sampleWait / (48 * parseInt(counts.innerText.slice(8)));
+		counter.innerText = counts.innerText.slice(8);
+		setTimeout(() => countdown(w), w);
+		if(backingData != null) {
+			backingNode = audioContext.createBufferSource();
+			backingNode.buffer = backingData;
+			backingNode.connect(audioContext.destination);
+			backingNode.start(audioContext.currentTime + sampleWait / 48000);
+		} else {
+			backingNode = null;
+		}
+	} else if(e.data.startsWith("stp:")) {
+		streamer.stop();
+		if(backingNode != null) backingNode.stop();
+	}
+});
+
+var streamer = new WSAudioAPI.Streamer({
+	//    App: 2048=voip, 2049=audio, 2051=low-delay
+	//    Sample Rate: 8000, 12000, 16000, 24000, or 48000
+	//    Frame Duration: 2.5, 5, 10, 20, 40, 60
+	//    Buffer Size = sample rate/6000 * 1024
+	codec: {
+		sampleRate: 48000,
+		channels: 1,
+		app: 2049,
+		frameDuration: 20,
+		bufferSize: 48000/6000 * 1024,
+	},
+}, ws);
+
+function generateMetronome(bpm, sig) {
+	let amt = 2000;
+	let out = new AudioBuffer({
+		length: 48000 * 60 * amt / bpm,
+		sampleRate: 48000,
+		numberOfChannels: 1
+	});
+	let buf = out.getChannelData(0);
+	let tick = j => {
+		for(let i = 0; i < 2400; i++) {
+			buf[j + i] = i % 48 >= 24 ? 0.8 : -0.8;
+		}
+	};
+	let uptick = j => {
+		for(let i = 0; i < 2400; i++) {
+			buf[j + i] = i % 24 >= 12 ? 0.8 : -0.8;
+		}
+	};
+	for(let i = 0; i < amt; i++) {
+		let sample = ((48000 * 60 * i) / bpm) >>> 0;
+		let downbeat = i % sig === 0;
+		if(downbeat) uptick(sample); else tick(sample);
+	}
+	return out;
+}
+
+function generateWav(pcm) {
+	let int = n => new Uint32Array([n]);
+	let short = n => new Uint16Array([n]);
+	// http://soundfile.sapp.org/doc/WaveFormat/
+	return new Blob([
+		// ChunkID, ChunkSize, Format
+		"RIFF", int(50 + pcm.length), "WAVE",
+		
+		// Subchunk1ID, Subchunk1Size, AudioFormat
+		"fmt ", int(18), short(3),
+		// NumChannels, SampleRate, ByteRate
+		short(1), int(48000), int(48000 * 4),
+		// BlockAlign, BitsPerSample, ExtensionSize
+		short(4), short(32), short(0),
+		
+		// Subchunk2ID, Subchunk2Size, SamplesPerChannel
+		"fact", int(4), int(pcm.length),
+
+		// Subchunk3ID, Subchunk3Size
+		"data", int(pcm.length * 4),
+		// Data
+		pcm.getChannelData(0)
+	], { type: "audio/wav" });
+}
+
+function countdown(w) {
+	let n = parseInt(counter.innerText) - 1;
+	if(n === 0) {
+		counter.innerText = "start!";
+	} else {
+		counter.innerText = n;
+		setTimeout(() => countdown(w), w);
+	}
+}
+
+function start() {
+	ws.send("srt:");
+	audioContext.resume();
+}
+
+function stop() {
+	ws.send("stp:");
+}
+
+function changeUsername() {
+	ws.send("usr:" + usernameInput.value);
+}
+
+function changeBPM() {
+	ws.send("bpm:" + bpmInput.value);
+}
+
+function changeCounts() {
+	ws.send("cnt:" + countsInput.value);
+}
+
+function changeCompression(v) {
+	if(v) {
+		ws.send("ops:");
+		compression.innerText = "using compression";
+	} else {
+		ws.send("nps:");
+		compression.innerText = "not using compression";
+	}
+	streamer.useCompression = v;
+}
+
+function changeBacking() {
+	ws.send("bck:");
+	backing.innerText = "sending backing track, please wait...";
+	ws.send(backingInput.files[0]);
+}
+
+function changeMetro() {
+	ws.send("met:" + metroInput.value + ":" + metroSigInput.value);
+}
+
+function changeOffset() {
+	ws.send("off:" + (parseInt(offsetInput.value) * 48));
+}
+
+function soloUser() {
+	ws.send("emg:" + soloInput.value);
+}
+
+function syncUser() {
+	let v = 0x1000000 + ((syncInput.value * 48) << 8);
+	ws.send("emg:" + soloInput.value + ":" + v);
+}
+
+function changeMinBuf() {
+	ws.send("buf:" + (parseInt(minBufInput.value) * 48));
+}
+
+function changeAudience(hears) {
+	ws.send(hears ? "abk:" : "nbk:");
+}
+
+let syncBackingNode = null;
+let syncAudioInput = null;
+let syncProcessor = null;
+let syncRecorded = null;
+let syncRecordIndex = 0;
+
+function beginSync() {
+	audioContext.resume();
+	if(backingData == null) {
+		alert("backing track is required for sync testing");
+		return;
+	}
+	navigator.getUserMedia(
+		{
+			audio: {
+				latency: 0,
+				echoCancellation: false,
+				mozNoiseSuppression: false,
+				mozAutoGainControl: false
+			}
+		},
+		function (stream) {
+			syncRecorded = new Float32Array(backingData.length); // only 1 channel
+			syncRecordIndex = 0;
+			syncAudioInput = audioContext.createMediaStreamSource(stream);
+			syncProcessor = audioContext.createScriptProcessor(8192, 1, 1);
+			syncProcessor.onaudioprocess = function(e) {
+				if(syncRecordIndex + e.inputBuffer.length > syncRecorded.length) return;
+				e.inputBuffer.copyFromChannel(syncRecorded.subarray(syncRecordIndex, syncRecordIndex + e.inputBuffer.length), 0);
+				syncRecordIndex += e.inputBuffer.length;
+			}
+			syncProcessor.connect(audioContext.destination);
+			syncBackingNode = audioContext.createBufferSource();
+			syncBackingNode.buffer = backingData;
+			syncBackingNode.connect(audioContext.destination);
+			syncBackingNode.start();
+			syncAudioInput.connect(syncProcessor);
+		},
+		alert
+	);
+
+}
+
+function endSync() {
+	if(syncBackingNode == null) return;
+	syncBackingNode.stop();
+	syncBackingNode = null;
+	syncAudioInput.disconnect();
+	syncAudioInput = null;
+	syncProcessor.disconnect();
+	syncProcessor = null;
+}
+
+let syncPlaybackNode = null;
+
+function playSync() {
+	let offset = parseInt(syncEarlier.value || 0) * 48;
+	let playback = new AudioBuffer({
+		length: backingData.length,
+		sampleRate: backingData.sampleRate,
+		numberOfChannels: backingData.numberOfChannels,
+	});
+	for(let c = 0; c < backingData.numberOfChannels; c++) {
+		let data = playback.getChannelData(c);
+		let base = backingData.getChannelData(c);
+		for(let i = 0; i < backingData.length; i++) {
+			data[i] = base[i];
+			if(i < syncRecorded.length - offset) data[i] += syncRecorded[i + offset];
+		}
+	}
+	if(syncPlaybackNode != null) syncPlaybackNode.stop();
+	syncPlaybackNode = audioContext.createBufferSource();
+	syncPlaybackNode.buffer = playback;
+	syncPlaybackNode.connect(audioContext.destination);
+	syncPlaybackNode.start();
+}
+
+function endPlaySync() {
+	if(syncPlaybackNode == null) return;
+	syncPlaybackNode.stop();
+	syncPlaybackNode = null;
+}
+</script>
+</body>
+</html>
