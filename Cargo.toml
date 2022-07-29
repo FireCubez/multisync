@@ -1,0 +1,15 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+websocket = "0.26"
+opus = "0.3"
+hound = "3.4"
+minimp3 = "0.5"
+slotmap = "1"
+ringbuf = "0.2"
+rodio = "0.15"
