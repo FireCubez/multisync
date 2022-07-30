@@ -15,7 +15,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use rodio::source::SineWave;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{Write, BufWriter};
 
 pub enum Backing {
 	File(Vec<u8>),
@@ -149,7 +149,7 @@ pub struct User {
 	key: DefaultKey,
 	offset: usize,
 	consumer_idx: usize,
-	producer_sender: Sender<Producer<i16>>,
+	producer_sender: Sender<(Producer<i16>, File)>,
 }
 
 fn decode_mp3(bytes: &[u8]) -> Result<(Vec<i16>, u16), minimp3::Error> {
@@ -440,6 +440,7 @@ fn main() {
 		std::thread::spawn(move || {
 			println!("client connected");
 			let mut producer = None;
+			let mut labels = None;
 			let mut decoder = Decoder::new(48000, opus::Channels::Mono).unwrap();
 			let mut sending_backing = false;
 			let mut packet_time = None;
@@ -447,7 +448,13 @@ fn main() {
 			let mut using_opus = false;
 			for msg in receiver.incoming_messages() {
 				//println!("message");
-				let msg = msg.unwrap();
+				let msg = match msg {
+					Ok(x) => x,
+					Err(e) => {
+						println!("disconnecting client due to error: {:?}", e);
+						break;
+					}
+				};
 				match msg {
 					OwnedMessage::Close(_) => {
 						let mut user = user.lock().unwrap();
@@ -536,7 +543,8 @@ fn main() {
 									room.users.retain(|_, user| {
 										let (prod, cons) = RingBuffer::new(0x1_000_000).split();
 										let mut user = user.lock().unwrap();
-										if user.producer_sender.send(prod).is_ok() {
+										let labels = File::create(format!("{}.txt", user.username)).unwrap();
+										if user.producer_sender.send((prod, labels)).is_ok() {
 											user.consumer_idx = consumers.len();
 											consumers.push(Stream::new(cons));
 											offsets.push(user.offset);
@@ -579,6 +587,7 @@ fn main() {
 										)).is_ok()
 									});
 									packet_time = None;
+									labels = None;
 									current_time = 0;
 								}
 								"bck:" => {
@@ -646,10 +655,13 @@ fn main() {
 								let len = s.len();
 								(s, len)
 							};
-							if let Ok(p) = producer_receiver.try_recv() {
+							if let Ok((p, l)) = producer_receiver.try_recv() {
 								producer = Some(p);
+								labels = Some(l);
 							} else if producer.is_none() { // if we don't have a producer from before
-								producer = Some(producer_receiver.recv().unwrap());
+								let (p, l) = producer_receiver.recv().unwrap();
+								producer = Some(p);
+								labels = Some(l);
 							}
 							if let Some(ptime) = packet_time {
 								if ptime > current_time {
@@ -668,6 +680,7 @@ fn main() {
 									let end = (current_time - ptime).min(samples.len());
 									samples.drain(0..end);
 								}
+								writeln!(labels.as_mut().unwrap(), "{}\t{}\t{}", ptime as f64 / 48000.0, ptime as f64 / 48000.0, ptime).unwrap();
 								packet_time = None;
 							}
 
