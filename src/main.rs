@@ -150,6 +150,7 @@ pub struct User {
 	offset: usize,
 	consumer_idx: usize,
 	producer_sender: Sender<(Producer<i16>, File)>,
+	async_sender: Sender<OwnedMessage>,
 }
 
 fn decode_mp3(bytes: &[u8]) -> Result<(Vec<i16>, u16), minimp3::Error> {
@@ -192,7 +193,7 @@ fn decode(bytes: &[u8]) -> Option<(Vec<i16>, u16)> {
 
 pub struct Stream {
 	cons: Consumer<i16>,
-	lag: usize,
+	lag: isize,
 }
 
 impl Stream {
@@ -201,7 +202,11 @@ impl Stream {
 	}
 
 	pub fn pop(&mut self) -> i16 {
-		while self.lag != 0 && self.cons.pop().is_some() {
+		if self.lag < 0 {
+			self.lag += 1;
+			return 0;
+		}
+		while self.lag > 0 && self.cons.pop().is_some() {
 			self.lag -= 1;
 		}
 
@@ -212,10 +217,19 @@ impl Stream {
 			0
 		}
 	}
+
+	pub fn stopped(&self) -> bool {
+		self.lag >= 24000 && self.cons.is_empty()
+	}
 }
 
 pub struct MultisyncSource {
-	consumers: Vec<Stream>,
+	syncing: bool,
+	users: Vec<(Stream, Sender<OwnedMessage>, String)>,
+	syncing_index: usize,
+	sync_seconds: usize,
+	stop_syncing: Arc<AtomicBool>,
+	stop_syncing_seconds: usize,
 	channels: u16,
 	current_channel: u16,
 	last_mono: i16,
@@ -225,6 +239,8 @@ pub struct MultisyncSource {
 	consumer_outputs: Vec<WavWriter<BufWriter<File>>>,
 	backing_output: WavWriter<BufWriter<File>>,
 	total_output: WavWriter<BufWriter<File>>,
+	stop_controller: Arc<AtomicBool>,
+	recording: Arc<AtomicBool>,
 }
 
 impl Source for MultisyncSource {
@@ -249,26 +265,65 @@ impl Iterator for MultisyncSource {
 	type Item = i16;
 
 	fn next(&mut self) -> Option<i16> {
+		if self.syncing {
+			if self.syncing_index == 0 {
+				self.sync_seconds += 1;
+				if self.sync_seconds % 2 == 1 && self.stop_syncing.swap(false, Ordering::Relaxed) {
+					println!("current seconds: {}", self.sync_seconds);
+					self.stop_syncing_seconds = self.sync_seconds + 8;
+					for u in &self.users {
+						if let Err(e) = u.1.send(OwnedMessage::Text(
+							format!("syncstop{}", self.stop_syncing_seconds - 1)
+						)) {
+							println!("{:?}", e);
+						}
+					}
+				}
+				if self.sync_seconds == self.stop_syncing_seconds {
+					self.syncing = false;
+				}
+			}
+		}
+		if self.syncing {
+			let mut ovr = self.override_controller.load(Ordering::Relaxed);
+			if ovr != usize::MAX && ovr >= 0x1000000 {
+				self.override_controller.store(usize::MAX, Ordering::Relaxed);
+				println!("sync override: {:x}", ovr);
+				ovr -= 0x1000000;
+				let idx = ovr & 0xFF;
+				self.users[idx].0.lag += (ovr >> 8 & 0xFFFF) as u16 as i16 as isize; // i dont know please send help its 5 days until the deadline
+			}
+			return self.sync_next();
+		}
+		let stopping = self.stop_controller.load(Ordering::Relaxed);
 		let mut overriden = false;
 		if self.current_channel == 0 {
 			let mut ovr = self.override_controller.load(Ordering::Relaxed);
 			if ovr != usize::MAX && ovr >= 0x1000000 {
-				self.override_controller.store(0, Ordering::Relaxed);
+				self.override_controller.store(usize::MAX, Ordering::Relaxed);
 				println!("sync override: {:x}", ovr);
 				ovr -= 0x1000000;
 				let idx = ovr & 0xFF;
-				self.consumers[idx].lag += ovr >> 8 & 0xFFFF;
-			} else if ovr < self.consumers.len() {
+				self.users[idx].0.lag += (ovr >> 8 & 0xFFFF) as u16 as i16 as isize; // i dont know please send help its 5 days until the deadline
+			} else if ovr < self.users.len() {
 				overriden = true;
-				self.last_mono = self.consumers[ovr].pop();
+				self.last_mono = self.users[ovr].0.pop();
+				if stopping && self.users[ovr].0.stopped() {
+					return None;
+				}
 			} else {
+				let mut stop = stopping && self.backing_index >= self.backing.len() as i32;
 				//self.last_mono = self.consumers.iter_mut().map(|x| x.pop().unwrap_or_default()).sum();
 				self.last_mono = 0;
-				for (i, cons) in self.consumers.iter_mut().enumerate() {
-					let s = cons.pop();
+				for (i, cons) in self.users.iter_mut().enumerate() {
+					let s = cons.0.pop();
+					if stop && !cons.0.stopped() {
+						stop = false;
+					}
 					self.last_mono += s;
 					self.consumer_outputs[i].write_sample(s).unwrap();
 				}
+				if stop { return None; }
 			}
 			//println!("setting last mono {}", self.last_mono);
 		}
@@ -282,7 +337,7 @@ impl Iterator for MultisyncSource {
 			}
 		}
 		if !wrote_backing {
-			self.backing_output.write_sample(0).unwrap();
+			self.backing_output.write_sample(0i16).unwrap();
 		}
 		self.backing_index += 1;
 		self.current_channel += 1;
@@ -295,11 +350,54 @@ impl Iterator for MultisyncSource {
 	}
 }
 
+impl MultisyncSource {
+	pub fn sync_next(&mut self) -> Option<i16> {
+		if self.syncing_index == 0 {
+			for u in &self.users {
+				if let Err(e) = u.1.send(OwnedMessage::Text("syncnewf".into())) {
+					println!("{:?}", e);
+				}
+			}
+			for i in 0..self.users.len() {
+				let con = &mut self.users[i].0;
+				let mut minmax = vec![0; 4800 * 2];
+				for i in 0..4800 {
+					let mut sect = [0; 10];
+					for el in &mut sect {
+						*el = con.pop();
+					}
+					let max = sect.iter().copied().max().unwrap();
+					let min = sect.iter().copied().min().unwrap();
+					minmax[i] = (max >> 8) as u8;
+					minmax[i + 4800] = (min >> 8) as u8;
+				}
+				for u in &self.users {
+					if let Err(e) = u.1.send(OwnedMessage::Binary(minmax.clone())) {
+						println!("{:?}", e);
+					}
+				}
+			}
+		}
+		self.syncing_index += 1;
+		if self.syncing_index >= 48000 {
+			self.syncing_index = 0;
+		}
+		Some(0)
+	}
+}
+
+impl Drop for MultisyncSource {
+	fn drop(&mut self) {
+		self.recording.store(false, Ordering::Relaxed);
+	}
+}
+
 pub enum AudioMessage {
-	StartRecording(Vec<Stream>, Vec<usize>, u16, Vec<i16>, i32),
-	StopRecording,
+	StartRecording(Vec<(Stream, Sender<OwnedMessage>, String)>, Vec<usize>, u16, Vec<i16>, i32, Arc<AtomicBool>),
+	StopRecording(bool),
 	Override(usize),
 	MinBuf(usize),
+	StopSync,
 	Beep
 }
 
@@ -309,23 +407,42 @@ fn audio_handler(audio_recv: Receiver<AudioMessage>) {
 	let (_stream, handle) = rodio::OutputStream::try_default().unwrap();
 	let mut sink = None;
 	let mut overrider = None;
+	let mut syncer = None;
+	let mut stopper = None;
 	let mut minbuf = DEFAULT_MIN_BUF_LEN;
 	loop {
 		match audio_recv.recv().unwrap() {
-			AudioMessage::StartRecording(mut consumers, offsets, channels, backing, backing_index) => {
+			AudioMessage::StartRecording(mut users, offsets, channels, backing, backing_index, recording) => {
 				if sink.is_some() { continue; }
 				println!("starting {}", channels);
 				
-				for consumer in &consumers {
-					while consumer.cons.len() < minbuf {
+				let mut idx_str = String::from("idx:");
+
+				for consumer in &users {
+					if idx_str.len() != 4 {
+						idx_str.push(';');
+					}
+					idx_str.push_str(&consumer.2);
+				}
+
+				for consumer in &users {
+					consumer.1.send(OwnedMessage::Text(idx_str.clone())).unwrap();
+				}
+
+				for consumer in &users {
+					println!("waiting for audio from {}", consumer.2);
+					while consumer.0.cons.len() < minbuf {
+						println!("{} len: {}", consumer.2, consumer.0.cons.len());
 						std::thread::sleep(Duration::from_millis(100));
 					}
+					println!("got audio from {}", consumer.2);
 				}
+				println!("has buffer");
 
 				let mut consumer_outputs = Vec::new();
 				let mut i = 0;
-				for (consumer, offset) in consumers.iter_mut().zip(offsets) {
-					consumer.lag += offset;
+				for (consumer, offset) in users.iter_mut().zip(offsets) {
+					consumer.0.lag += offset as isize;
 					consumer_outputs.push(WavWriter::create(format!("./cons{}.wav", i), WavSpec {
 						bits_per_sample: 16,
 						channels: 1,
@@ -348,8 +465,15 @@ fn audio_handler(audio_recv: Receiver<AudioMessage>) {
 				}).unwrap();
 				let s = Sink::try_new(&handle).unwrap();
 				let override_controller = Arc::new(AtomicUsize::new(usize::MAX));
+				let stop_syncing = Arc::new(AtomicBool::new(false));
+				let stop_controller = Arc::new(AtomicBool::new(false));
 				s.append(MultisyncSource {
-					consumers,
+					syncing: true,
+					users,
+					syncing_index: 0,
+					sync_seconds: 0,
+					stop_syncing: stop_syncing.clone(),
+					stop_syncing_seconds: 0,
 					channels,
 					current_channel: 0,
 					last_mono: 0,
@@ -359,13 +483,23 @@ fn audio_handler(audio_recv: Receiver<AudioMessage>) {
 					consumer_outputs,
 					backing_output,
 					total_output,
+					stop_controller: stop_controller.clone(),
+					recording,
 				});
 				overrider = Some(override_controller);
+				syncer = Some(stop_syncing);
 				sink = Some(s);
+				stopper = Some(stop_controller);
 			}
-			AudioMessage::StopRecording => {
-				sink = None;
-				overrider = None;
+			AudioMessage::StopRecording(instant) => {
+				if instant {
+					sink = None;
+					overrider = None;
+					syncer = None;
+					stopper = None;
+				} else if let Some(s) = stopper.take() {
+					s.store(true, Ordering::Relaxed);
+				}
 			}
 			AudioMessage::Override(idx) => {
 				if let Some(o) = &overrider {
@@ -374,6 +508,11 @@ fn audio_handler(audio_recv: Receiver<AudioMessage>) {
 			}
 			AudioMessage::MinBuf(min) => {
 				minbuf = min;
+			}
+			AudioMessage::StopSync => {
+				if let Some(s) = syncer.take() {
+					s.store(true, Ordering::Relaxed);
+				}
 			}
 			AudioMessage::Beep => {
 				handle.play_raw(SineWave::new(1000.0).take_duration(Duration::from_millis(200))).unwrap();
@@ -406,6 +545,11 @@ fn main() {
 				continue;
 			}
 		};
+		if recording.load(Ordering::Relaxed) {
+			println!("not allowing connection; we are recording");
+			let _ = request.reject();
+			return;
+		}
 		let client = request.accept().unwrap();
 		let (mut receiver, mut sender) = client.split().unwrap();
 		let mut room_lock = room.lock().unwrap();
@@ -420,6 +564,7 @@ fn main() {
 			}
 		}
 		let (producer_sender, producer_receiver) = mpsc::channel();
+		let (async_sender, async_receiver) = mpsc::channel();
 		let mut user = Arc::new(Mutex::new(User {
 			sender,
 			username: String::from("(user is connecting)"),
@@ -427,10 +572,18 @@ fn main() {
 			offset: 0,
 			consumer_idx: 0,
 			producer_sender,
+			async_sender,
 		}));
 		room_lock.users.insert_with_key(|key| {
 			Arc::get_mut(&mut user).unwrap().get_mut().unwrap().key = key;
 			user.clone()
+		});
+		let user2 = user.clone();
+		std::thread::spawn(move || {
+			println!("created async ws thread");
+			for x in async_receiver {
+				user2.lock().unwrap().sender.send_message(&x).unwrap();
+			}
 		});
 		room_lock.update_info(false);
 		drop(room_lock);
@@ -457,10 +610,6 @@ fn main() {
 				};
 				match msg {
 					OwnedMessage::Close(_) => {
-						let mut user = user.lock().unwrap();
-						println!("user {} disconnected", user.username);
-						let _ = user.sender.send_message(&OwnedMessage::Close(None));
-						room.lock().unwrap().users.remove(user.key);
 						break;
 					}
 					OwnedMessage::Ping(p) => {
@@ -538,18 +687,20 @@ fn main() {
 									if recording.swap(true, Ordering::Relaxed) { continue; }
 									let mut room = room.lock().unwrap();
 									let count_delay = 48000 * 60 * room.counts / room.bpm;
-									let mut consumers = Vec::new();
+									let mut users = Vec::new();
 									let mut offsets = Vec::new();
 									room.users.retain(|_, user| {
 										let (prod, cons) = RingBuffer::new(0x1_000_000).split();
 										let mut user = user.lock().unwrap();
 										let labels = File::create(format!("{}.txt", user.username)).unwrap();
 										if user.producer_sender.send((prod, labels)).is_ok() {
-											user.consumer_idx = consumers.len();
-											consumers.push(Stream::new(cons));
+											println!("user {}", user.username);
+											user.consumer_idx = users.len();
+											users.push((Stream::new(cons), user.async_sender.clone(), user.username.clone()));
 											offsets.push(user.offset);
 											true
 										} else {
+											println!("user {} disconnected because producer sender", user.username);
 											false
 										}
 									});
@@ -560,7 +711,9 @@ fn main() {
 									};
 									let backing_index = -(count_delay as i32) * channels as i32;
 									room.users.retain(|_, user| {
+										println!("locking user");
 										let mut user = user.lock().unwrap();
+										println!("sending start to user: {}", user.username);
 										user.sender
 											.send_message(&OwnedMessage::Text(format!(
 												"srt:{}",
@@ -570,26 +723,35 @@ fn main() {
 									});
 									audio_send
 										.send(AudioMessage::StartRecording(
-											consumers,
+											users,
 											offsets,
 											channels,
 											backing,
 											backing_index,
+											recording.clone(),
 										))
 										.unwrap();
 								}
+								"sts:" => {
+									audio_send.send(AudioMessage::StopSync).unwrap();
+								},
 								"stp:" => {
-									if !recording.swap(false, Ordering::Relaxed) { continue; }
-									audio_send.send(AudioMessage::StopRecording).unwrap();
+									if !recording.load(Ordering::Relaxed) { continue; }
+									audio_send.send(AudioMessage::StopRecording(
+										t.as_bytes().get(4).copied() == Some(b't')
+									)).unwrap();
 									room.lock().unwrap().users.retain(|_, user| {
 										user.lock().unwrap().sender.send_message(&OwnedMessage::Text(
 											String::from("stp:")
 										)).is_ok()
 									});
+								}
+								"end:" => {
+									// sent when clients recieve stp:
 									packet_time = None;
 									labels = None;
 									current_time = 0;
-								}
+								},
 								"bck:" => {
 									sending_backing = true;
 								}
@@ -696,6 +858,12 @@ fn main() {
 					OwnedMessage::Pong(_) => {}
 				}
 			}
+			let mut user = user.lock().unwrap();
+			println!("user {} disconnected", user.username);
+			let _ = user.sender.send_message(&OwnedMessage::Close(None));
+			let mut room = room.lock().unwrap();
+			room.users.remove(user.key);
+			room.update_info(false);
 		});
 	}
 }

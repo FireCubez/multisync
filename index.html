@@ -12,6 +12,7 @@
 <h1 id="status"></h1>
 <div id="loading">connecting to server...</div>
 <div id="loaded">
+	<div id="req_access"><strong>press this button --></strong> <button onclick="requestAudioAccess()">request audio access</button></div>
 	<span id="online">loading online users...</span>
 	<input id="username" type="text" placeholder="username" />
 	<button onclick="changeUsername()">change username</button>
@@ -35,10 +36,11 @@
 	<input id="metro_in" type="text" placeholder="bpm" />
 	<input id="metro_sig_in" type="text" placeholder="time signature" />/4
 	<button onclick="changeMetro()">use metronome backing track</button>
+	<br><br><button onclick="clearBacking()">clear backing track (not recommended if multiple people are playing)</button>
 	<br><br><span id="audience">loading backing track distribution...</span>
 	<button onclick="changeAudience(true)">audience and performers hear backing track</button>
 	<button onclick="changeAudience(false)">only performers hear backing track</button>
-	<hr>
+	<!-- <hr>
 	<h2>warning: compression is broken right now</h2>
 	<span id="compression">not using compression</span>
 	<button onclick="changeCompression(true)">enable compression</button>
@@ -54,27 +56,38 @@
 	<input id="sync_earlier" type="text" placeholder="ms earlier">
 	<button onclick="playSync()">play sync</button>
 	<button onclick="endPlaySync()">stop playing sync</button>
-	<hr>
-	<h2>advanced stuff</h2>
+	<hr>-->
+	<h2>sync</h2>
+	<p>try to line up the waveform to the <strong>beginning</strong> and <strong>middle</strong> of this preview</p>
+	<p id="sync_user_header"></p>
+	<ol id="sync_user_list"></ol>
+	<canvas id="sync_vis"></canvas><br>
 	<input id="target_in" type="text" placeholder="username" />
 	<input id="sync_in" type="text" placeholder="sync">
-	<button onclick="soloUser()">stop multisync; just play the audio for this user</button>
-	<button onclick="syncUser()">make user earlier (ms)</button>
+	<button onclick="syncUser()">make user earlier (ms) (leave username blank for you)</button>
+	<br>sync volume: <input id="sync_vol" type="range" min="0" max="1" step="any" value="0.8" onchange="setSyncVolume()" />
+	<br>
+	<h2>advanced stuff</h2>
+	<button onclick="soloUser()">stop multisync; just play the audio for the user typed above (leave username blank for you)</button>
 	<br><br><span id="sbuf">loading minimum sample buffer size...</span>
 	<input id="sbuf_in" type="text" placeholder="minimum sample buffer size">
 	<button onclick="changeMinBuf()">set minimum sample buffer size (ms) (more = playback starts later for audience, but more lag tolerance)</button>
+	<br><button onclick="stop(true)">stop for everyone, don't wait for buffer (will cut off a bit of the audio)</button>
 	<hr>
-	<h1>status: currently not live</h1>
+	<h1 id="rec_status">status: currently not live</h1>
 	<button onclick="start()">start for everyone</button>
-	<button onclick="stop()">stop for everyone</button>
-	<h1 id="counter"></h1>
+	<button onclick="stop(false)">stop for everyone</button>
+	<button onclick="stopSync()">stop syncing and begin live performance! (only do when synced)</button>
 </div>
 
 <script>
+	window.bufferSize = 8192;
 	window.audioContext = new AudioContext({
 		sampleRate: 48000
 	});
 	if(window.audioContext.sampleRate !== 48000) alert("Your browser does not support the required sample rate, instead " + window.audioContext.sampleRate);
+	audioContext.audioWorklet.addModule("./server_worklet.js");
+	//audioContext.audioWorklet.addModule("./sync_worklet.js");
 </script>
 <script src="./ws-audio-api.min.js"></script>
 <script>
@@ -98,20 +111,29 @@ let compression = document.getElementById("compression");
 let backing = document.getElementById("backing");
 let backingAudio = document.getElementById("backing_au");
 let backingInput = document.getElementById("backing_in");
-let counter = document.getElementById("counter");
 let offsetInput = document.getElementById("off_in");
 let soloInput = document.getElementById("target_in");
 let syncInput = document.getElementById("sync_in");
 let syncEarlier = document.getElementById("sync_earlier");
+let canvas = document.getElementById("sync_vis");
+let ctx = canvas.getContext("2d");
 let minBuf = document.getElementById("sbuf");
 let minBufInput = document.getElementById("sbuf_in");
 let metroInput = document.getElementById("metro_in");
 let metroSigInput = document.getElementById("metro_sig_in");
 let audience = document.getElementById("audience");
+let recStatus = document.getElementById("rec_status");
+let syncVol = document.getElementById("sync_vol");
+let syncUserHeader = document.getElementById("sync_user_header");
+let syncUserList = document.getElementById("sync_user_list");
 let backingData = null;
 let backingNode = null;
 let metronomeBPM = 0;
 let metronomeSig = 0;
+let sampleWait = 0;
+let syncs = [];
+let syncing = false;
+let syncIndex = 0;
 loaded.className = "hide";
 
 usernameInput.value = "anon" + (Math.random() * 100000 >>> 0);
@@ -137,8 +159,55 @@ ws.addEventListener("close", e => {
 	loading.innerText = "connection to server was closed";
 });
 
+function handleSyncMessage(msg) {
+	if(msg === "newf") {
+		syncIndex = 0;
+	}
+	if(msg.startsWith("stop")) {
+		streamer.recorder.port.postMessage({
+			syncBeat: true,
+			val: parseInt(msg.slice(4)) * 2
+		});
+	}
+}
+
+function handleSyncBin(x) {
+	let nums = new Int8Array(x);
+	syncs[syncIndex] = { max: nums.subarray(0, nums.length >> 1), min: nums.subarray(nums.length >> 1) };
+	syncIndex++;
+}
+
 ws.addEventListener("message", e => {
-	if(e.data instanceof Blob) {
+	console.log(e.data);
+	if(e.data instanceof ArrayBuffer) {
+		if(syncing) {
+			handleSyncBin(e.data);
+			return;
+		}
+		backingAudio.src = URL.createObjectURL(new Blob([e.data]));
+		backingAudio.load();
+		backing.innerText = "decoding backing track";
+		audioContext.decodeAudioData(e.data, d => {
+			backing.innerText = "decoded backing track";
+			setTimeout(() => {
+				backing.innerText = "";
+			}, 1000);
+			backingData = d;
+		}, () => {
+			if(e.data.byteLength === 0) {
+				backing.innerText = "backing track is empty";
+			} else {
+				backing.innerText = "failed to decode backing track";
+			}
+			backingData = null;
+		});
+	} else if(e.data instanceof Blob) {
+		if(syncing) {
+			e.data.arrayBuffer().then(x => {
+				handleSyncBin(x);
+			});
+			return;
+		}
 		backing.innerText = "loading backing track";
 		backingAudio.src = URL.createObjectURL(e.data);
 		backingAudio.load();
@@ -151,10 +220,16 @@ ws.addEventListener("message", e => {
 				}, 1000);
 				backingData = d;
 			}, () => {
-				backing.innerText = "failed to decode backing track";
+				if(x.byteLength === 0) {
+					backing.innerText = "backing track is empty";
+				} else {
+					backing.innerText = "failed to decode backing track";
+				}
 				backingData = null;
 			});
 		});
+	} else if(e.data.startsWith("sync")) {
+		handleSyncMessage(e.data.slice(4));
 	} else if(e.data.startsWith("onl:")) {
 		onlineUsers.innerText = "online users: " + e.data.slice(4);
 	} else if(e.data.startsWith("bpm:")) {
@@ -162,9 +237,24 @@ ws.addEventListener("message", e => {
 	} else if(e.data.startsWith("cnt:")) {
 		counts.innerText = "counts: " + e.data.slice(4);
 	} else if(e.data.startsWith("buf:")) {
-		minBuf.innerText = "minimum sample buffer size: " + e.data.slice(4);
+		minBuf.innerText = "minimum sample buffer size: " + parseInt(e.data.slice(4)) / 48 + "ms";
 	} else if(e.data.startsWith("bck:")) {
 		backing.innerText = "backing track is changing, please wait...";
+	} else if(e.data.startsWith("idx:")) {
+		let userIdx = e.data.slice(4).split(";");
+		syncUserList.innerHTML = "";
+		for(let i = 0; i < userIdx.length; i++) {
+			let el = document.createElement("li");
+			el.innerText = userIdx[i];
+			syncUserList.appendChild(el);
+		}
+		syncUserHeader.innerText = "this is the order of the waveforms below.";
+	} else if(e.data.startsWith("abk:")) {
+		if(e.data[4] === "t") {
+			audience.innerText = "audience and performers hear backing track";
+		} else {
+			audience.innerText = "only performers hear backing track";
+		}
 	} else if(e.data.startsWith("met:")) {
 		backing.innerText = "backing track is being generated, plese wait...";
 		let parts = e.data.split(":");
@@ -180,18 +270,23 @@ ws.addEventListener("message", e => {
 		}, 1000);
 		backingData = pcm;
 	} else if(e.data.startsWith("srt:")) {
-		let sampleWait = parseInt(e.data.slice(4));
+		sampleWait = parseInt(e.data.slice(4));
+		syncing = true;
 		streamer.samplesWritten = 0;
+		let backingWaitCount = parseInt(counts.innerText.slice(8));
+		let w = sampleWait / backingWaitCount;
 		streamer.backing = {
-			backingData,
-			backingIdx: -sampleWait,
+			backingData: backingData && backingData.getChannelData(0),
+			backingWait: w,
+			backingWaitCount,
+			vol: syncVol.value,
 		};
+		streamer.recStatus = recStatus;
 		streamer.start();
-		let w = sampleWait / (48 * parseInt(counts.innerText.slice(8)));
-		counter.innerText = counts.innerText.slice(8);
-		setTimeout(() => countdown(w), w);
+		recStatus.innerText = "status: syncing";
 	} else if(e.data.startsWith("stp:")) {
 		streamer.stop();
+		ws.send("end:");
 	}
 });
 
@@ -205,7 +300,7 @@ var streamer = new WSAudioAPI.Streamer({
 		channels: 1,
 		app: 2049,
 		frameDuration: 20,
-		bufferSize: 48000/6000 * 1024,
+		bufferSize: window.bufferSize,
 	},
 }, ws);
 
@@ -260,23 +355,13 @@ function generateWav(pcm) {
 	], { type: "audio/wav" });
 }
 
-function countdown(w) {
-	let n = parseInt(counter.innerText) - 1;
-	if(n === 0) {
-		counter.innerText = "start!";
-	} else {
-		counter.innerText = n;
-		setTimeout(() => countdown(w), w);
-	}
-}
-
 function start() {
+	if(backingData == null && !confirm("no backing track is selected, are you sure?")) return;
 	ws.send("srt:");
-	audioContext.resume();
 }
 
-function stop() {
-	ws.send("stp:");
+function stop(a) {
+	ws.send("stp:" + a);
 }
 
 function changeUsername() {
@@ -321,7 +406,9 @@ function soloUser() {
 }
 
 function syncUser() {
-	let v = 0x1000000 + ((syncInput.value * 48) << 8);
+	let samples = syncInput.value * 48;
+	if(samples < 0) { samples += 0x10000; }
+	let v = 0x1000000 + (samples << 8);
 	ws.send("emg:" + soloInput.value + ":" + v);
 }
 
@@ -333,7 +420,24 @@ function changeAudience(hears) {
 	ws.send(hears ? "abk:" : "nbk:");
 }
 
-let syncAudioInput = null;
+function clearBacking() {
+	ws.send(new ArrayBuffer(0));
+}
+
+function stopSync() {
+	ws.send("sts:");
+}
+
+function setSyncVolume() {
+	if(streamer.recorder != null) streamer.recorder.port.postMessage({ syncBeat: false, val: syncVol.value });
+}
+
+function requestAudioAccess() {
+	audioContext.resume();
+	document.getElementById("req_access").className = "hide";
+}
+
+/*let syncAudioInput = null;
 let syncProcessor = null;
 let syncRecorded = null;
 let syncRecordIndex = 0;
@@ -359,32 +463,17 @@ function beginSync() {
 			syncRecordIndex = 0;
 			didntShowSyncBufferAlert = true;
 			syncAudioInput = audioContext.createMediaStreamSource(stream);
-			syncProcessor = audioContext.createScriptProcessor(8192, 1, 2);
-			syncProcessor.onaudioprocess = function(e) {
-				if(syncRecordIndex + e.inputBuffer.length > syncRecorded.length) return;
-				if(e.inputBuffer.length !== e.outputBuffer && didntShowSyncBufferAlert) {
-					didntShowSyncBufferAlert = false;
-					alert("input buffer (" + e.inputBuffer.length + ") and output buffer (" + e.outputBuffer + ") are not equal, something is wrong");
-				}
-				e.inputBuffer.copyFromChannel(syncRecorded.subarray(syncRecordIndex, syncRecordIndex + e.inputBuffer.length), 0);
-				if(backingData != null) {
-					e.outputBuffer.copyToChannel(
-						backingData.getChannelData(0).subarray(
-							syncRecordIndex, syncRecorded + e.outputBuffer.length
-						),
-						0
-					);
-					e.outputBuffer.copyToChannel(
-						backingData.getChannelData(backingData.numberOfChannels - 1).subarray(
-							syncRecordIndex, syncRecordIndex + e.outputBuffer.length
-						),
-						1
-					);
-				}
-				syncRecordIndex += e.inputBuffer.length;
-			}
-			syncProcessor.connect(audioContext.destination);
+			syncProcessor = new AudioWorkletNode(audioContext, "sync-streamer", {
+				processorOptions: backingData.getChannelData(0),
+				channelCount: 1,
+				channelCountMode: "explicit"
+			});
+			syncProcessor.port.onmessage = e => {
+				syncRecorded.set(e.data, syncRecordIndex);
+				syncRecordIndex += e.data.length;
+			};
 			syncAudioInput.connect(syncProcessor);
+			syncProcessor.connect(audioContext.destination);
 		},
 		alert
 	);
@@ -426,6 +515,86 @@ function endPlaySync() {
 	if(syncPlaybackNode == null) return;
 	syncPlaybackNode.stop();
 	syncPlaybackNode = null;
+}*/
+
+let previewSize = 1;
+let previewOffset = 0;
+function draw() {
+	requestAnimationFrame(draw);
+	ctx.fillStyle = "#eee";
+	ctx.fillRect(0, 0, canvas.width, canvas.height);
+	
+	ctx.fillStyle = "#00ff00";
+	ctx.globalAlpha = 0.5;
+	ctx.fillRect(canvas.width / 2, 0, canvas.width, canvas.height);
+	ctx.globalAlpha = 1;
+
+	ctx.strokeStyle = "#000";
+	ctx.lineWidth = 1;
+	for(let i = 0; i < syncs.length; i++) {
+		drawWaveform(syncs[i].max, syncs[i].min, syncs.length, i);
+	}
+}
+
+requestAnimationFrame(draw);
+
+function drawWaveform(maxs, mins, divs, divIdx) {
+	let divSize = canvas.height / divs;
+	let divCenter = divSize * divIdx + divSize / 2;
+	let mult = maxs.length / canvas.width;
+	for(let x = 0; x < canvas.width; x++) {
+		let start = Math.round(x * mult * previewSize + previewOffset);
+		let end = Math.round(start + mult * previewSize);
+
+		let max = Math.max(...maxs.slice(start, end)) / 128;
+		let min = Math.min(...mins.slice(start, end)) / 128;
+		let upY = divCenter - max * divSize / 2;
+		let downY = divCenter - min * divSize / 2;
+		ctx.beginPath();
+		ctx.moveTo(x, upY);
+		ctx.lineTo(x, downY);
+		ctx.stroke();
+	}
+}
+
+/*function test() {
+	audioContext.resume();
+	if(backingData == null) {
+		alert("backing track is required for sync testing");
+		return;
+	}
+	navigator.getUserMedia(
+		{
+			audio: {
+				latency: 0,
+				echoCancellation: false,
+				mozNoiseSuppression: false,
+				mozAutoGainControl: false
+			}
+		},
+		function (stream) {
+			let audioInput = audioContext.createMediaStreamSource(stream);
+			let processor = audioContext.createScriptProcessor(window.bu, 1, 1);
+			let idx = 0;
+			window.testBuffer = new Float32Array(480000);
+			processor.onaudioprocess = function(e) {
+				if(idx > window.testBuffer.length - e.inputBuffer.length) return;
+				e.inputBuffer.copyFromChannel(window.testBuffer.subarray(idx, idx + e.inputBuffer.length), 0);
+				idx += e.inputBuffer.length;
+				
+			}
+			processor.connect(audioContext.destination);
+			audioInput.connect(processor);
+		},
+		alert
+	);
+}*/
+
+function download(buf) {
+	let a = document.createElement("a");
+	a.href = URL.createObjectURL(new Blob([buf], { type: "application/octet-stream" }));
+	a.click();
+	return a.href;
 }
 </script>
 </body>
