@@ -87,7 +87,6 @@
 	});
 	if(window.audioContext.sampleRate !== 48000) alert("Your browser does not support the required sample rate, instead " + window.audioContext.sampleRate);
 	audioContext.audioWorklet.addModule("./server_worklet.js");
-	//audioContext.audioWorklet.addModule("./sync_worklet.js");
 </script>
 <script src="./ws-audio-api.min.js"></script>
 <script>
