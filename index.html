@@ -33,6 +33,9 @@
 	<input id="backing_in" type="file" />
 	<button onclick="changeBacking()">change backing track</button>
 	<br><br>
+	<input id="local_in" type="file" />
+	<button onclick="changeLocal()">change local track</button>
+	<br><br>
 	<input id="metro_in" type="text" placeholder="bpm" />
 	<input id="metro_sig_in" type="text" placeholder="time signature" />/4
 	<button onclick="changeMetro()">use metronome backing track</button>
@@ -125,8 +128,10 @@ let recStatus = document.getElementById("rec_status");
 let syncVol = document.getElementById("sync_vol");
 let syncUserHeader = document.getElementById("sync_user_header");
 let syncUserList = document.getElementById("sync_user_list");
+let localInput = document.getElementById("local_in");
 let backingData = null;
 let backingNode = null;
+let localBacking = null;
 let metronomeBPM = 0;
 let metronomeSig = 0;
 let sampleWait = 0;
@@ -144,6 +149,9 @@ ws.addEventListener("open", e => {
 	loading.className = "hide";
 	loaded.className = "";
 	changeUsername();
+	setInterval(() => {
+		ws.send("KEEPALIVE");
+	}, 5000);
 });
 
 ws.addEventListener("error", e => {
@@ -213,6 +221,15 @@ ws.addEventListener("message", e => {
 		e.data.arrayBuffer().then(x => {
 			backing.innerText = "decoding backing track";
 			audioContext.decodeAudioData(x, d => {
+				if(localBacking != null) {
+					backing.innerText = "adding local backing track";
+					for(let ch = 0; ch < d.numberOfChannels; ch++) {
+						let data = d.getChannelData(ch);
+						for(let i = 0; i < data.length; i++) {
+							if(i < localBacking.length) data[i] += localBacking[i];
+						}
+					}
+				}
 				backing.innerText = "decoded backing track";
 				setTimeout(() => {
 					backing.innerText = "";
@@ -390,6 +407,17 @@ function changeBacking() {
 	ws.send("bck:");
 	backing.innerText = "sending backing track, please wait...";
 	ws.send(backingInput.files[0]);
+}
+
+function changeLocal() {
+	localInput.files[0].arrayBuffer().then(x => {
+		audioContext.decodeAudioData(x, d => {
+			localBacking = d.getChannelData(0);
+			alert("local track set! audience will not hear this, but you will. THIS ONLY APPLIES TO YOU, be sure the other person sets their local too");
+		}, () => {
+			alert("local track decode error");
+		});
+	});
 }
 
 function changeMetro() {

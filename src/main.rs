@@ -320,7 +320,7 @@ impl Iterator for MultisyncSource {
 					if stop && !cons.0.stopped() {
 						stop = false;
 					}
-					self.last_mono += s;
+					self.last_mono = self.last_mono.saturating_add(s);
 					self.consumer_outputs[i].write_sample(s).unwrap();
 				}
 				if stop { return None; }
@@ -527,7 +527,7 @@ fn main() {
 	let room = Arc::new(Mutex::new(Room {
 		users: SlotMap::new(),
 		bpm: 60,
-		counts: 4,
+		counts: 10,
 		min_buf_len: DEFAULT_MIN_BUF_LEN,
 		backing: Backing::File(Vec::new()),
 		audience_hears: true,
